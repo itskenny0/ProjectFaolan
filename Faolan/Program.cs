@@ -7,10 +7,13 @@ using System.Threading.Tasks;
 using Faolan.AgentServer;
 using Faolan.Core;
 using Faolan.Core.Database;
+using Faolan.Core.Extensions;
+using Faolan.Core.Network;
 using Faolan.CSPlayerAgent;
 using Faolan.Extensions;
 using Faolan.GameServer;
 using Faolan.PlayerAgent;
+using Faolan.Properties;
 using Faolan.UniverseAgent;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
@@ -21,15 +24,8 @@ using Microsoft.Extensions.Logging;
 
 namespace Faolan
 {
-    public class Startup
+    public static class Program
     {
-        public Startup(IConfiguration configuration)
-        {
-            Configuration = configuration;
-        }
-
-        public IConfiguration Configuration { get; }
-
         [STAThread]
         public static async Task Main(string[] args)
         {
@@ -37,6 +33,9 @@ namespace Faolan
             Console.WriteLine(Statics.Banner);
 
             var host = Host.CreateDefaultBuilder(args)
+                /*#if DEBUG
+                .UseEnvironment("Development")
+                #endif*/
                 .ConfigureAppConfiguration((hostingContext, config) =>
                 {
                     config.SetBasePath(Directory.GetCurrentDirectory());
@@ -55,47 +54,49 @@ namespace Faolan
                         options.SingleLine = true;
                     });
                 })
-                .UseStartup<Startup>()
+                .ConfigureServices((context, services) =>
+                {
+                    services.AddLogging();
+
+                    /*var hex = Resources.bigboy.Replace("\r", "").Replace("\n", "")
+                        .Replace(",", "").Replace("0x", "").Replace(" ", "")
+                        .HexToByteArray();
+
+                    var p = new ConanPacket(hex);
+                    var x = PacketUtils.PacketToCsCode(p);
+                    System.IO.File.WriteAllBytes("c:/temp/bigboy.bin", hex);*/
+
+                    services.AddDbContext<IDatabaseContext, DatabaseContext>(options => { options.UseSqlite($"Data Source={context.Configuration.DatabasePath()}", x => x.MigrationsAssembly("Faolan")); });
+
+                    services.AddScoped<IDatabaseRepository, DatabaseRepository>();
+                    services.AddHostedService<DatabaseMigrator>();
+
+                    services.AddHostedService<UniverseAgentListener>();
+                    services.AddHostedService<PlayerAgentListener>();
+                    services.AddHostedService<CsPlayerAgentListener>();
+
+                    //services.AddHostedService<AgentServerListener>(); // workaround below
+                    services.AddSingleton<AgentServerListener>();
+                    services.AddHostedService(p => p.GetRequiredService<AgentServerListener>());
+
+                    services.AddHostedService(provider =>
+                    {
+                        var loggerFactory = provider.GetRequiredService<ILoggerFactory>();
+                        var configuration = provider.GetRequiredService<IConfiguration>();
+                        var dataRepository = provider.GetRequiredService<IDatabaseRepository>();
+                        var agentServerListener = provider.GetRequiredService<AgentServerListener>();
+
+                        var realm = dataRepository.Context.Realms.FirstOrDefault();
+                        if (realm == null)
+                            throw new Exception("realm == null");
+
+                        return new GameServerListener(loggerFactory.CreateLogger($"{typeof(GameServerListener).FullName}-{realm.Id}"),
+                            configuration, dataRepository, realm.Port, agentServerListener);
+                    });
+                })
                 .Build();
 
             await host.RunAsync();
-        }
-
-        public void ConfigureServices(IServiceCollection services)
-        {
-            services.AddLogging();
-
-            services.AddDbContext<IDatabaseContext, DatabaseContext>(options =>
-            {
-                options.UseSqlite($"Data Source={Configuration.DatabasePath()}", x => x.MigrationsAssembly("Faolan"));
-            });
-
-            services.AddScoped<IDatabaseRepository, DatabaseRepository>();
-            services.AddHostedService<DatabaseMigrator>();
-
-            services.AddHostedService<UniverseAgentListener>();
-            services.AddHostedService<PlayerAgentListener>();
-            services.AddHostedService<CsPlayerAgentListener>();
-
-            //services.AddHostedService<AgentServerListener>(); // workaround below
-            services.AddSingleton<AgentServerListener>();
-            services.AddHostedService(p => p.GetRequiredService<AgentServerListener>());
-
-            services.AddHostedService(provider =>
-            {
-                var loggerFactory = provider.GetRequiredService<ILoggerFactory>();
-                var configuration = provider.GetRequiredService<IConfiguration>();
-                var dataRepository = provider.GetRequiredService<IDatabaseRepository>();
-                var agentServerListener = provider.GetRequiredService<AgentServerListener>();
-
-                var realm = dataRepository.Context.Realms.FirstOrDefault();
-                if (realm == null)
-                    throw new Exception("realm == null");
-
-                return new GameServerListener(
-                    loggerFactory.CreateLogger($"{typeof(GameServerListener).FullName}-{realm.Id}"),
-                    configuration, dataRepository, realm.Port, agentServerListener);
-            });
         }
     }
 
