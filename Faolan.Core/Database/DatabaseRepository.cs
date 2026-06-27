@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Linq;
 using System.Numerics;
+using System.Threading;
 using System.Threading.Tasks;
 using Faolan.Core.Data;
 using Faolan.Core.Network;
@@ -36,6 +37,15 @@ namespace Faolan.Core.Database
 
 	public class DatabaseRepository : IDatabaseRepository
 	{
+		// A single DbContext is shared by every listener for the whole process (the listeners are
+		// singletons; the scoped repository resolves once from the root scope). A real client holds its
+		// PlayerAgent + AgentServer + GameServer connections open at the same time and their packet
+		// handlers run concurrently on threadpool threads — and DbContext is NOT thread-safe ("A second
+		// operation was started on this context instance"). Serialize every context access through this
+		// gate so concurrent handlers can't corrupt the context. DB work here is tiny and infrequent
+		// (login / char-list / enter-world), so serializing it has no meaningful cost.
+		private readonly SemaphoreSlim _gate = new(1, 1);
+
 		public DatabaseRepository(IDatabaseContext databaseContext)
 		{
 			Context = databaseContext;
@@ -43,107 +53,138 @@ namespace Faolan.Core.Database
 
 		public IDatabaseContext Context { get; }
 
-		public async Task<bool> CheckLogin(string username, string password)
+		private async Task<T> Guarded<T>(Func<Task<T>> op)
+		{
+			await _gate.WaitAsync();
+			try
+			{
+				return await op();
+			}
+			finally
+			{
+				_gate.Release();
+			}
+		}
+
+		public Task<bool> CheckLogin(string username, string password)
 		{
 			username = username.ToLower(); // skip check password for now
-			return await Context.Accounts.AnyAsync(a => a.UserName.ToLower() == username);
+			return Guarded(() => Context.Accounts.AnyAsync(a => a.UserName.ToLower() == username));
 		}
 
-		public async Task<bool> UpdateLastInfo(Account account, INetworkClient client)
+		public Task<bool> UpdateLastInfo(Account account, INetworkClient client)
 		{
-			account.LastConnection = DateTime.UtcNow;
-			account.LastIpAddress = client.IpAddress;
-			return await Context.SaveChangesAsync() > 0;
-		}
-
-		public async Task<bool> UpdateLastInfo(Character character, INetworkClient client)
-		{
-			character.LastConnection = DateTime.UtcNow;
-			character.LastIpAddress = client.IpAddress;
-			return await Context.SaveChangesAsync() > 0;
-		}
-
-		public async Task<bool> UpdateClientInstance(Account account, uint characterId)
-		{
-			if (account.ClientInstance == characterId)
-				return true;
-
-			account.ClientInstance = characterId;
-			return await Context.SaveChangesAsync() > 0;
-		}
-
-		public async Task<Account> GetAccount(uint id)
-		{
-			return await Context.Accounts.FirstOrDefaultAsync(a => a.Id == id);
-		}
-
-		public async Task<Account> GetAccount(string userName)
-		{
-			return await Context.Accounts.FirstOrDefaultAsync(a => a.UserName == userName);
-		}
-
-		public async Task<Character> GetCharacter(uint id)
-		{
-			return await Context.Characters.FirstOrDefaultAsync(a => a.Id == id);
-		}
-
-		public async Task<Character[]> GetCharactersByAccount(uint id, bool skipUninitialized = true)
-		{
-			var q = Context.Characters.Where(a => a.AccountId == id);
-			if (skipUninitialized)
-				q = q.Where(c => c.Name != null);
-
-			return await q.ToArrayAsync();
-		}
-
-		public async Task<Character> CreateCharacter(uint accountId, uint realmId)
-		{
-			var character = await Context.Characters.FirstOrDefaultAsync(c => c.AccountId == accountId && c.Name == null);
-			if (character == null)
+			return Guarded(async () =>
 			{
-				character = new Character
+				account.LastConnection = DateTime.UtcNow;
+				account.LastIpAddress = client.IpAddress;
+				return await Context.SaveChangesAsync() > 0;
+			});
+		}
+
+		public Task<bool> UpdateLastInfo(Character character, INetworkClient client)
+		{
+			return Guarded(async () =>
+			{
+				character.LastConnection = DateTime.UtcNow;
+				character.LastIpAddress = client.IpAddress;
+				return await Context.SaveChangesAsync() > 0;
+			});
+		}
+
+		public Task<bool> UpdateClientInstance(Account account, uint characterId)
+		{
+			return Guarded(async () =>
+			{
+				if (account.ClientInstance == characterId)
+					return true;
+
+				account.ClientInstance = characterId;
+				return await Context.SaveChangesAsync() > 0;
+			});
+		}
+
+		public Task<Account> GetAccount(uint id)
+		{
+			return Guarded(() => Context.Accounts.FirstOrDefaultAsync(a => a.Id == id));
+		}
+
+		public Task<Account> GetAccount(string userName)
+		{
+			return Guarded(() => Context.Accounts.FirstOrDefaultAsync(a => a.UserName == userName));
+		}
+
+		public Task<Character> GetCharacter(uint id)
+		{
+			return Guarded(() => Context.Characters.FirstOrDefaultAsync(a => a.Id == id));
+		}
+
+		public Task<Character[]> GetCharactersByAccount(uint id, bool skipUninitialized = true)
+		{
+			return Guarded(() =>
+			{
+				var q = Context.Characters.Where(a => a.AccountId == id);
+				if (skipUninitialized)
+					q = q.Where(c => c.Name != null);
+
+				return q.ToArrayAsync();
+			});
+		}
+
+		public Task<Character> CreateCharacter(uint accountId, uint realmId)
+		{
+			return Guarded(async () =>
+			{
+				var character = await Context.Characters.FirstOrDefaultAsync(c => c.AccountId == accountId && c.Name == null);
+				if (character == null)
 				{
-					AccountId = accountId,
-					RealmId = realmId,
-					CreationDate = DateTime.UtcNow
-				};
+					character = new Character
+					{
+						AccountId = accountId,
+						RealmId = realmId,
+						CreationDate = DateTime.UtcNow
+					};
 
-				// ReSharper disable once MethodHasAsyncOverload
-				Context.Characters.Add(character);
-				await Context.SaveChangesAsync();
-			}
+					// ReSharper disable once MethodHasAsyncOverload
+					Context.Characters.Add(character);
+					await Context.SaveChangesAsync();
+				}
 
-			return character;
+				return character;
+			});
 		}
 
-		public async Task<bool> UpdateCharacterPosition(uint id, Vector3? position = null, Vector3? rotation = null)
+		public Task<bool> UpdateCharacterPosition(uint id, Vector3? position = null, Vector3? rotation = null)
 		{
-			var character = await Context.Characters.FirstOrDefaultAsync(c => c.Id == id);
-			if (character == null)
-				return false;
+			return Guarded(async () =>
+			{
+				var character = await Context.Characters.FirstOrDefaultAsync(c => c.Id == id);
+				if (character == null)
+					return false;
 
-			if (position.HasValue)
-				character.Position = position.Value;
+				if (position.HasValue)
+					character.Position = position.Value;
 
-			if (rotation.HasValue)
-				character.Rotation = rotation.Value;
+				if (rotation.HasValue)
+					character.Rotation = rotation.Value;
 
-			return await Context.SaveChangesAsync() > 0;
+				return await Context.SaveChangesAsync() > 0;
+			});
 		}
 
-		public async Task<Realm> GetRealm(uint id)
+		public Task<Realm> GetRealm(uint id)
 		{
-			return await Context.Realms.FirstOrDefaultAsync(r => r.Id == id);
+			return Guarded(() => Context.Realms.FirstOrDefaultAsync(r => r.Id == id));
 		}
 
-		public async Task<Map> GetMap(uint id)
+		public Task<Map> GetMap(uint id)
 		{
-			return await Context.Maps.FirstOrDefaultAsync(m => m.Id == id);
+			return Guarded(() => Context.Maps.FirstOrDefaultAsync(m => m.Id == id));
 		}
 
-		public async Task<Spell> GetSpell(uint id)
+		public Task<Spell> GetSpell(uint id)
 		{
-			return await Context.Spells.FirstOrDefaultAsync(s => s.Id == id);
+			return Guarded(() => Context.Spells.FirstOrDefaultAsync(s => s.Id == id));
 		}
 	}
 }

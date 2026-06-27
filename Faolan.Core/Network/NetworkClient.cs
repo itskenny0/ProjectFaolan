@@ -12,6 +12,10 @@ namespace Faolan.Core.Network
 	public interface INetworkClient
 	{
 		string IpAddress { get; }
+
+		/// <summary>True while the underlying socket is live. Goes false once the client disconnects.</summary>
+		bool Connected { get; }
+
 		Account Account { get; set; }
 		Character Character { get; }
 
@@ -38,8 +42,33 @@ namespace Faolan.Core.Network
             _isAgentServer = isAgentServer;
         }
 
-		public string IpAddress => ((IPEndPoint)Socket.RemoteEndPoint)?.Address.ToString();
+		// Must never throw: it is read from the receive/send error paths and the connect/disconnect
+		// loggers, which run exactly when the socket is being torn down. A disconnecting client nulls
+		// (and now disposes) Socket on one path while another path reads IpAddress -> dereferencing a
+		// null/disposed Socket threw an unhandled NullReferenceException that aborted the whole process.
+		// Guard the null/disposed socket and cache the last known address so logs stay useful after teardown.
+		private string _ipAddress;
+
+		public string IpAddress
+		{
+			get
+			{
+				try
+				{
+					var ip = (Socket?.RemoteEndPoint as IPEndPoint)?.Address.ToString();
+					if (ip != null) _ipAddress = ip;
+				}
+				catch
+				{
+					// Socket disposed mid-read; fall back to the cached value.
+				}
+
+				return _ipAddress;
+			}
+		}
         //public ushort LocalPort => (ushort)(((IPEndPoint)Socket.LocalEndPoint)?.Port ?? 0);
+
+		public bool Connected => Socket != null;
 
 		public Account Account { get; set; }
 		public Character Character => Account?.Character;
@@ -51,6 +80,8 @@ namespace Faolan.Core.Network
 	public class NetworkClient<TPacket> : NetworkClient
 		where TPacket : Packet
 	{
+		private const int MaxMessageSize = 4 * 1024 * 1024;
+
 		private readonly object _lock = new();
 		private readonly byte[] _packetLengthBuffer = new byte[sizeof(int)];
 		private readonly byte[] _tcpBuffer = new byte[0xFFFF];
@@ -105,6 +136,7 @@ namespace Faolan.Core.Network
 				catch // (Exception e)
 				{
 					Disconnected?.Invoke(this);
+					Socket?.Dispose();
 					Socket = null;
 				}
 			}
@@ -120,7 +152,15 @@ namespace Faolan.Core.Network
 					{
 						var bytesRead = Socket.EndReceive(ar);
 						if (bytesRead == 0)
+						{
+							// Graceful remote close: fire the disconnect path and tear the socket down,
+							// otherwise the receive loop just stops and the stale client lingers (and
+							// Connected would still report true).
+							Disconnected?.Invoke(this);
+							Socket?.Dispose();
+							Socket = null;
 							return;
+						}
 
 						var buffer = _tcpBuffer.Take(bytesRead).ToArray();
 
@@ -142,6 +182,7 @@ namespace Faolan.Core.Network
 					catch // (Exception e)
 					{
 						Disconnected?.Invoke(this);
+						Socket?.Dispose();
 						Socket = null;
 					}
 				}, null);
@@ -149,6 +190,7 @@ namespace Faolan.Core.Network
 			catch // (Exception e)
 			{
 				Disconnected?.Invoke(this);
+				Socket?.Dispose();
 				Socket = null;
 			}
 		}
@@ -211,9 +253,13 @@ namespace Faolan.Core.Network
 					if (length < 0)
 						throw new ProtocolViolationException("Message length is less than zero");
 
-					// Another sanity check is needed here for very large packets, to prevent denial-of-service attacks
-					/* if (MaxMessageSize > 0 && length > MaxMessageSize)
-					    throw new ProtocolViolationException($"Message length {length} is larger than maximum message size {MaxMessageSize}"); */
+					// Reject oversized frames to prevent denial-of-service via huge allocation.
+					// THROW (don't return) — like the length<0 guard above: returning from here leaves
+					// _packetBytesRead at sizeof(int) and DataReceived's `while (i != length)` loop never
+					// advances (bytesTransferred stays 0), spinning forever. The throw unwinds to the
+					// BeginReceive callback's catch, which disconnects cleanly.
+					if (length > MaxMessageSize)
+						throw new ProtocolViolationException($"Message length {length} exceeds maximum {MaxMessageSize}");
 
 					// Zero-length packets are allowed as keepalives
 					if (length == 0)

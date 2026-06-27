@@ -58,7 +58,20 @@ namespace Faolan.Core.Network
 						throw new Exception("networkClient == null");
 
 					networkClient.Disconnected = ClientDisconnected;
-					networkClient.ReceivedPacket = (s, e) => ReceivedPacket(s, (TPacket)e);
+					networkClient.ReceivedPacket = async (s, e) =>
+					{
+						// The receive loop invokes this without awaiting, so without a try/catch a throwing
+						// handler becomes a silently-unobserved task exception (the client just gets no
+						// response and nothing is logged). Log it instead so handler failures are visible.
+						try
+						{
+							await ReceivedPacket(s, (TPacket)e);
+						}
+						catch (Exception handlerEx)
+						{
+							Logger.LogError(handlerEx, $"Error handling {typeof(TPacket).Name} from {s.IpAddress}");
+						}
+					};
 					ClientConnected(networkClient);
 
 					networkClient.Start();
