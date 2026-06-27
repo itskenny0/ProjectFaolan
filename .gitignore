@@ -257,3 +257,15 @@ ModelManifest.xml
 /.contextkeeper/
 /Faolan/faolan.db-wal
 /Faolan/faolan.db-shm
+
+# local client install / dumps / uploads (never track)
+Age of Conan/
+aoc.exe
+AgeOfConan.mcl
+dbDebug.patcher
+Local State
+*.dmp
+CrashLog.txt
+RawCallstack.txt
+status.bin
+stderr.txt
