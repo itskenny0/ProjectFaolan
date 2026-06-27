@@ -1123,6 +1123,12 @@ namespace Faolan.GameServer
 
                         SendShit(client);
 
+                        // DB-driven NPC population: spawn every NPC whose MapId matches the player's
+                        // character map into the player's world (playfield 0xC350). Additive and strictly
+                        // behind the player spawn above — if there are no rows, nothing extra is sent.
+                        foreach (var npc in await Database.GetNpcsByMap(client.Character?.MapId ?? 0))
+                            SendSpawnNpc(client, npc);
+
                         ///////////////////////////////////////
 
                         // Old Tarantia Docks notification

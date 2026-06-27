@@ -33,6 +33,8 @@ namespace Faolan.Core.Database
 		Task<Map> GetMap(uint id);
 
 		Task<Spell> GetSpell(uint id);
+
+		Task<Npc[]> GetNpcsByMap(uint mapId);
 	}
 
 	public class DatabaseRepository : IDatabaseRepository
@@ -185,6 +187,11 @@ namespace Faolan.Core.Database
 		public Task<Spell> GetSpell(uint id)
 		{
 			return Guarded(() => Context.Spells.FirstOrDefaultAsync(s => s.Id == id));
+		}
+
+		public Task<Npc[]> GetNpcsByMap(uint mapId)
+		{
+			return Guarded(() => Context.Npcs.Where(n => n.MapId == mapId).ToArrayAsync());
 		}
 	}
 }
