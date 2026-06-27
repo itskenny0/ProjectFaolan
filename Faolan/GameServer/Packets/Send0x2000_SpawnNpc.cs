@@ -190,57 +190,107 @@ namespace Faolan.GameServer
             0xE0, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xF1
         };
 
-        // Identifiers / offsets baked into the template above (verified against the capture).
+        // Offsets/identifiers in the proven version-65 template, plus the ProtoCoreCharacterIIR field plan
+        // recovered from the exe (/root/aoc-depthmap/proto-schema.txt). The character payload is a protobuf
+        // message, big-endian-u16 length-prefixed at offset 406. The v5.01 CTD is a missing RDB mesh for an
+        // equipment item (field 23 inventory_entry): the client's n3VisualDynel::AddAttractorMesh NULL guard
+        // only logs, then writes through the null. So we rebuild the message WITHOUT field 23 (no equipment
+        // meshes to resolve) and WITHOUT field 6 (player_stats = the player/PvP identity), and set field 1
+        // (name). The body/race (field 4 stats) is kept, so it still renders.
         private const uint NpcTemplateObjId = 0x1101B4F5; // captured player's object id, at body offset 12
-        // Position lives just after the 0x2C0A0F0D marker. ConanStream.WriteFloat writes native
-        // little-endian (no byte reversal), so the template stores X/Y/Z little-endian too.
-        private const int NpcPosXOffset = 24;
-        private const int NpcPosYOffset = 29;
-        private const int NpcPosZOffset = 34;
+        private const int NpcPosXOffset = 24, NpcPosYOffset = 29, NpcPosZOffset = 34;
+        private const int NpcMsgLenPrefix = 406; // big-endian u16 length of the ProtoCoreCharacterIIR
+        private const int NpcMsgStart = 408;     // first byte of that message (field 1, the name)
 
-        // Replace every big-endian occurrence of oldId with newId across the whole blob so the cloned
-        // spawn binds to its own object id (envelope objId plus any owned sub-object references).
+        private static ulong ReadVarint(byte[] b, ref int i)
+        {
+            ulong v = 0; int shift = 0;
+            while (i < b.Length) { byte x = b[i++]; v |= (ulong)(x & 0x7F) << shift; if ((x & 0x80) == 0) break; shift += 7; }
+            return v;
+        }
+
+        private static void WriteVarint(System.Collections.Generic.List<byte> o, ulong v)
+        {
+            while (v >= 0x80) { o.Add((byte)(v | 0x80)); v >>= 7; }
+            o.Add((byte)v);
+        }
+
+        // Rebuild a ProtoCoreCharacterIIR: drop player_stats (6) and inventory_entry (23), replace the name
+        // (1), copy every other field verbatim so the body stays intact.
+        private static byte[] RebuildNpcCharacter(byte[] msg, string name)
+        {
+            var o = new System.Collections.Generic.List<byte>(msg.Length);
+            int i = 0;
+            while (i < msg.Length)
+            {
+                int start = i;
+                ulong tag = ReadVarint(msg, ref i);
+                int field = (int)(tag >> 3), wire = (int)(tag & 7);
+                switch (wire)
+                {
+                    case 0: ReadVarint(msg, ref i); break;
+                    case 1: i += 8; break;
+                    case 2: { ulong len = ReadVarint(msg, ref i); i += (int)len; } break;
+                    case 5: i += 4; break;
+                    default: return msg; // unexpected wire type: ship the original rather than corrupt it
+                }
+                if (i > msg.Length) return msg;
+                if (field == 6 || field == 23) continue;
+                if (field == 1)
+                {
+                    var nb = System.Text.Encoding.ASCII.GetBytes(name);
+                    o.Add(0x0A); WriteVarint(o, (ulong)nb.Length); o.AddRange(nb);
+                    continue;
+                }
+                for (int k = start; k < i; k++) o.Add(msg[k]);
+            }
+            return o.ToArray();
+        }
+
+        // Replace every big-endian occurrence of oldId with newId so the spawn binds to its own object id.
         private static void ReplaceUInt32(byte[] data, uint oldId, uint newId)
         {
             var o0 = (byte)(oldId >> 24); var o1 = (byte)(oldId >> 16); var o2 = (byte)(oldId >> 8); var o3 = (byte)oldId;
             var n0 = (byte)(newId >> 24); var n1 = (byte)(newId >> 16); var n2 = (byte)(newId >> 8); var n3 = (byte)newId;
             for (int i = 0; i + 4 <= data.Length; i++)
-            {
                 if (data[i] == o0 && data[i + 1] == o1 && data[i + 2] == o2 && data[i + 3] == o3)
-                {
-                    data[i] = n0; data[i + 1] = n1; data[i + 2] = n2; data[i + 3] = n3;
-                    i += 3;
-                }
-            }
+                { data[i] = n0; data[i + 1] = n1; data[i + 2] = n2; data[i + 3] = n3; i += 3; }
         }
 
-        // Overwrite a 4-byte position float in-place, little-endian to match the template's stored layout.
         private static void WriteFloatLittleEndian(byte[] data, int offset, float value)
         {
-            var b = BitConverter.GetBytes(value); // native little-endian on this platform
+            var b = BitConverter.GetBytes(value);
             data[offset] = b[0]; data[offset + 1] = b[1]; data[offset + 2] = b[2]; data[offset + 3] = b[3];
         }
 
-        // Spawn one DB NPC into the player's world (playfield 0xC350) by cloning the version-65 player
-        // template and substituting object id / position / name. Purely additive: the player spawn that
-        // SendShit sends is untouched (this uses its own private template copy).
+        // Spawn one DB NPC into the player's world (playfield 0xC350): keep the proven version-65 IIR
+        // framing, rebuild the character message field-aware (no equipment, no PvP), set id/position/name.
+        // Additive: the player spawn SendShit sends is untouched.
         private void SendSpawnNpc(INetworkClient client, Npc npc)
         {
             if (npc == null) return;
+            var t = _npcSpawnTemplate;
 
-            var blob = (byte[])_npcSpawnTemplate.Clone();
+            int declared = (t[NpcMsgLenPrefix] << 8) | t[NpcMsgLenPrefix + 1];
+            int msgEnd = NpcMsgStart + declared;
+            if (msgEnd > t.Length) return; // template shape unexpected; skip rather than risk a client
 
-            // (1+2) Unique per-NPC object id, distinct from the player's 0x1101B4F5; rebind every reference.
-            var npcObjId = 0x11020000u + npc.Id;
-            ReplaceUInt32(blob, NpcTemplateObjId, npcObjId);
+            var rebuilt = RebuildNpcCharacter(t[NpcMsgStart..msgEnd],
+                string.IsNullOrEmpty(npc.Name) ? "Npc" : npc.Name);
 
-            // (4) Position (in-place, no length change).
+            var blob = new byte[NpcMsgStart + rebuilt.Length + (t.Length - msgEnd)];
+            System.Array.Copy(t, 0, blob, 0, NpcMsgStart);
+            blob[NpcMsgLenPrefix] = (byte)(rebuilt.Length >> 8); blob[NpcMsgLenPrefix + 1] = (byte)rebuilt.Length;
+            System.Array.Copy(rebuilt, 0, blob, NpcMsgStart, rebuilt.Length);
+            System.Array.Copy(t, msgEnd, blob, NpcMsgStart + rebuilt.Length, t.Length - msgEnd);
+
+            uint inner = (uint)(blob.Length - 4);
+            blob[0] = (byte)(inner >> 24); blob[1] = (byte)(inner >> 16); blob[2] = (byte)(inner >> 8); blob[3] = (byte)inner;
+
+            ReplaceUInt32(blob, NpcTemplateObjId, 0x11020000u + npc.Id);
             WriteFloatLittleEndian(blob, NpcPosXOffset, npc.Position.X);
             WriteFloatLittleEndian(blob, NpcPosYOffset, npc.Position.Y);
             WriteFloatLittleEndian(blob, NpcPosZOffset, npc.Position.Z);
-
-            // (3) Name: splice + fix the name-length byte, enclosing protobuf u16, and envelope innerLen.
-            blob = InjectSpawnName(blob, string.IsNullOrEmpty(npc.Name) ? "Npc" : npc.Name);
 
             var sender = new byte[] { 0x0D, 0x13, 0xCE, 0x71, 0xB1, 0x10, 0x5A };
             var receiver = new byte[] { 0x0D, 0x47, 0xC1, 0x67, 0x6C, 0x10, 0xD4, 0xCB, 0x8B, 0x40 };
